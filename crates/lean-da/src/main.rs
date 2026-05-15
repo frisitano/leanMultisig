@@ -212,27 +212,48 @@ fn build_column_commit_public_input(codewords: &[Vec<EF>]) -> [F; 8] {
     let leaf_len = leaf_len_ext * dim;
     let row_len = 2 * (1 << LOG_M);
     let num_leaves = row_len / leaf_len_ext;
+    let num_systematic_leaves = (1 << LOG_M) / leaf_len_ext;
 
     let rows: Vec<Vec<F>> = codewords
         .iter()
         .map(|codeword| serialize_codeword_for_witness(codeword))
         .collect();
 
-    let mut column_roots = Vec::with_capacity(num_leaves);
-    for leaf_idx in 0..num_leaves {
-        let mut cell_digests = Vec::with_capacity(n_blobs);
-        for row in &rows {
+    let mut leaf_digests = vec![[F::ZERO; 8]; num_leaves * n_blobs_padded];
+    for (row_idx, row) in rows.iter().enumerate() {
+        for leaf_idx in 0..num_leaves {
             let start = leaf_idx * leaf_len;
             let leaf = &row[start..start + leaf_len];
-            cell_digests.push(utils::poseidon_compress_slice(leaf, false));
+            leaf_digests[leaf_idx * n_blobs_padded + row_idx] = utils::poseidon_compress_slice(leaf, false);
         }
-        for _ in n_blobs..n_blobs_padded {
-            cell_digests.push([F::ZERO; 8]);
-        }
+    }
+
+    let mut row_digests = Vec::with_capacity(n_blobs);
+    for row_idx in 0..n_blobs {
+        let systematic_digests = (0..num_systematic_leaves)
+            .map(|leaf_idx| leaf_digests[leaf_idx * n_blobs_padded + row_idx]);
+        row_digests.push(chain_hash_digests(systematic_digests));
+    }
+    let row_commitment_root = chain_hash_digests(row_digests);
+
+    let mut column_roots = Vec::with_capacity(num_leaves);
+    for leaf_idx in 0..num_leaves {
+        let start = leaf_idx * n_blobs_padded;
+        let cell_digests = leaf_digests[start..start + n_blobs_padded].to_vec();
         column_roots.push(merkle_root_from_digests(cell_digests));
     }
 
-    merkle_root_from_digests(column_roots)
+    let column_commitment_root = merkle_root_from_digests(column_roots);
+    let commitment_root = utils::poseidon16_compress_pair(&row_commitment_root, &column_commitment_root);
+    commitment_root
+}
+
+fn chain_hash_digests(digests: impl IntoIterator<Item = [F; 8]>) -> [F; 8] {
+    let mut state = [F::ZERO; 8];
+    for digest in digests {
+        state = utils::poseidon16_compress_pair(&state, &digest);
+    }
+    state
 }
 
 fn merkle_root_from_digests(mut layer: Vec<[F; 8]>) -> [F; 8] {

@@ -8,12 +8,14 @@ LEAF_LEN = LEAF_LEN_EXT * DIM
 LEAF_NUM_CHUNKS = LEAF_LEN / DIGEST_LEN
 LOG_NUM_LEAVES = LOG_M + 1 - LOG_LEAF_LEN_EXT
 NUM_LEAVES = 2 ** LOG_NUM_LEAVES
+LOG_NUM_SYSTEMATIC_LEAVES = LOG_M - LOG_LEAF_LEN_EXT
+NUM_SYSTEMATIC_LEAVES = 2 ** LOG_NUM_SYSTEMATIC_LEAVES
 
 N_BLOBS = N_BLOBS_PLACEHOLDER
 N_BLOBS_PADDED = N_BLOBS_PADDED_PLACEHOLDER
 LOG_N_BLOBS_PADDED = LOG_N_BLOBS_PADDED_PLACEHOLDER
 
-PUB_COLUMN_ROOT = 0
+PUB_COMMITMENT_ROOT = 0
 
 
 def main():
@@ -21,6 +23,7 @@ def main():
 
     codewords = Array(N_BLOBS)
     leaf_digests = Array(NUM_LEAVES * N_BLOBS_PADDED * DIGEST_LEN)
+    row_digests = Array(N_BLOBS * DIGEST_LEN)
 
     for row in unroll(0, N_BLOBS):
         codeword = Array(2 * M * DIM)
@@ -33,9 +36,13 @@ def main():
                 leaf_digests + (col * N_BLOBS_PADDED + row) * DIGEST_LEN,
             )
 
+        hash_row_systematic_digests(leaf_digests + row * DIGEST_LEN, row_digests + row * DIGEST_LEN)
+
     for col in unroll(0, NUM_LEAVES):
         for row in unroll(N_BLOBS, N_BLOBS_PADDED):
             zero_digest(leaf_digests + (col * N_BLOBS_PADDED + row) * DIGEST_LEN)
+
+    row_commitment_root = hash_row_commitment_root(row_digests)
 
     column_roots = Array(NUM_LEAVES * DIGEST_LEN)
     for col in unroll(0, NUM_LEAVES):
@@ -46,9 +53,11 @@ def main():
         copy_digest(column_root, column_roots + col * DIGEST_LEN)
 
     column_commitment_root = merkle_root_from_digests(column_roots, LOG_NUM_LEAVES)
-    assert_eq_digest(column_commitment_root, PUB_COLUMN_ROOT)
+    commitment_root = Array(DIGEST_LEN)
+    poseidon16_compress(row_commitment_root, column_commitment_root, commitment_root)
+    assert_eq_digest(commitment_root, PUB_COMMITMENT_ROOT)
 
-    r = column_commitment_root
+    r = commitment_root
     slice_L, slice_R = barycentric_slices(r)
 
     for row in unroll(0, N_BLOBS):
@@ -57,6 +66,28 @@ def main():
         dot_product_ee(codewords[row] + M * DIM, slice_R, eval_check, M)
 
     return
+
+
+@inline
+def hash_row_systematic_digests(first_row_digest, dest):
+    state: Mut = Array(DIGEST_LEN)
+    zero_digest(state)
+    for col in unroll(0, NUM_SYSTEMATIC_LEAVES):
+        new_state = Array(DIGEST_LEN)
+        poseidon16_compress(state, first_row_digest + col * N_BLOBS_PADDED * DIGEST_LEN, new_state)
+        state = new_state
+    copy_digest(state, dest)
+    return
+
+
+def hash_row_commitment_root(digests):
+    state: Mut = Array(DIGEST_LEN)
+    zero_digest(state)
+    for i in unroll(0, N_BLOBS):
+        new_state = Array(DIGEST_LEN)
+        poseidon16_compress(state, digests + i * DIGEST_LEN, new_state)
+        state = new_state
+    return state
 
 
 def assert_eq_digest(a, b):
