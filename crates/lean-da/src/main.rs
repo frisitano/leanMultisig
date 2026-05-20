@@ -1,4 +1,5 @@
 mod cache;
+mod lean_air;
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::Instant;
@@ -30,6 +31,22 @@ struct Cli {
     construction: Construction,
     #[arg(long, help = "Enable tracing")]
     tracing: bool,
+    #[arg(long, alias = "direct-air-census", help = "Print the LeanAIR table census and exit")]
+    lean_air_census: bool,
+    #[arg(
+        long,
+        alias = "direct-air-sweep",
+        help = "Print a fused LeanAIR shape sweep and exit"
+    )]
+    lean_air_sweep: bool,
+    #[arg(long, help = "Maximum blob count for --lean-air-sweep", default_value_t = 128)]
+    max_n_blobs: usize,
+    #[arg(
+        long,
+        help = "Cell size in extension-field elements for --lean-air-census",
+        default_value_t = lean_air::DEFAULT_CELL_LEN_EXT
+    )]
+    cell_len_ext: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -60,11 +77,155 @@ fn main() {
     if cli.tracing {
         utils::init_tracing();
     }
+    if cli.lean_air_census {
+        print_lean_air_census(cli.n_blobs, cli.cell_len_ext);
+        return;
+    }
+    if cli.lean_air_sweep {
+        print_lean_air_sweep(cli.max_n_blobs);
+        return;
+    }
 
     let bytecode = compile_lean_da_bytecode(cli.n_blobs, cli.construction);
     let (witness, public_input) = build_instance(cli.n_blobs, cli.construction);
     let proof = prove_lean_da(&bytecode, &public_input, &witness, cli.n_blobs, cli.construction);
     verify_lean_da(&bytecode, &public_input, proof.proof);
+}
+
+fn data_kib(shape: lean_air::LeanAirShape) -> f64 {
+    const F_BITS: usize = 31;
+    (shape.data_len_base() * F_BITS) as f64 / (8.0 * 1024.0)
+}
+
+fn print_lean_air_census(n_blobs: usize, cell_len_ext: usize) {
+    let shape = lean_air::LeanAirShape {
+        log_m: LOG_M,
+        n_rows: n_blobs,
+        cell_len_ext,
+    };
+    let census = lean_air::estimate_air_census(shape);
+    let plan = lean_air::LeanAirTablePlan::new(shape);
+    let labels = [
+        "CellHash",
+        "RowDigest",
+        "RowRoot",
+        "ColumnMerkle",
+        "ColumnRoot",
+        "FinalRoot",
+    ];
+
+    println!("LeanAIR census");
+    println!("n_rows:              {n_blobs}");
+    println!("cell_len_ext:        {cell_len_ext}");
+    println!("num_cells:           {}", shape.num_cells());
+    println!("num_systematic_cells:{}", shape.num_systematic_cells());
+    println!("Poseidon calls by kind:");
+    for (label, count) in labels.iter().zip(census.poseidon_calls_by_kind) {
+        println!("  {label:13} {count:>10}");
+    }
+    println!(
+        "Poseidon rows:       {} -> padded {}",
+        census.poseidon_rows, census.poseidon_rows_padded
+    );
+    println!(
+        "Control rows:        {} -> padded {}",
+        census.control_rows, census.control_rows_padded
+    );
+    println!(
+        "Row parity rows:     {} -> padded {}",
+        census.row_parity_rows, census.row_parity_rows_padded
+    );
+    println!("Total active rows:   {}", census.total_active_table_rows());
+    println!("Total padded rows:   {}", census.total_padded_table_rows());
+    println!(
+        "Padding ratio:       {:.2}x",
+        census.padding_overhead_bps() as f64 / 10_000.0
+    );
+    println!(
+        "Fused total rows:    {} -> padded {}",
+        census.fused_hash_active_table_rows(),
+        census.fused_hash_padded_table_rows()
+    );
+    println!(
+        "Fused row reduction: {:.2}%",
+        census.fused_hash_row_reduction_bps() as f64 / 100.0
+    );
+    println!(
+        "RLC parity rows:     {} -> padded {}",
+        census.materialized_rlc_parity_rows(),
+        census.materialized_rlc_parity_rows_padded()
+    );
+    println!(
+        "Fused + RLC rows:    {} -> padded {}",
+        census.fused_hash_materialized_rlc_rows(),
+        census.fused_hash_materialized_rlc_padded_rows()
+    );
+    println!(
+        "Fused virtual RLC:   padded {}",
+        census.fused_hash_virtual_rlc_padded_rows()
+    );
+    println!("Cell digests:        {}", census.cell_digest_count());
+    println!("Digest bindings:     {}", census.digest_binding_entries());
+    println!("Duplicated memory:   {} FE", census.duplicated_memory_fes);
+    println!("Shared memory est.:  {} FE", census.shared_memory_fes_estimate);
+    println!("Hash chunks/cell:    {}", plan.hash.chunks_per_cell);
+    println!("Hash schedule:");
+    print_row_range("  cell_hash", plan.hash.cell_hash);
+    print_row_range("  row_digest", plan.hash.row_digest);
+    print_row_range("  row_root", plan.hash.row_root);
+    print_row_range("  column_merkle", plan.hash.column_merkle);
+    print_row_range("  column_root", plan.hash.column_root);
+    print_row_range("  final_root", plan.hash.final_root);
+    println!(
+        "RowParity schedule:  rows {}..{} -> padded {}",
+        0, plan.row_parity.active_rows, plan.row_parity.padded_rows
+    );
+}
+
+fn print_row_range(label: &str, range: lean_air::RowRange) {
+    println!("{label:16} {}..{} ({})", range.start, range.end(), range.len);
+}
+
+fn print_lean_air_sweep(max_n_blobs: usize) {
+    let mut candidates = Vec::new();
+    for cell_len_ext in [16, 32, 64, 128] {
+        for n_rows in 1..=max_n_blobs {
+            let shape = lean_air::LeanAirShape {
+                log_m: LOG_M,
+                n_rows,
+                cell_len_ext,
+            };
+            if !shape.codeword_len_ext().is_multiple_of(cell_len_ext) {
+                continue;
+            }
+            let census = lean_air::estimate_air_census(shape);
+            let kib = data_kib(shape);
+            let fused_rows = census.fused_hash_padded_table_rows();
+            let kib_per_mrow = kib * 1_000_000.0 / fused_rows as f64;
+            candidates.push((kib_per_mrow, kib, census));
+        }
+    }
+    candidates.sort_by(|a, b| b.0.total_cmp(&a.0));
+
+    println!("Top fused LeanAIR shapes by data per padded table row");
+    println!(
+        "{:>4} {:>5} {:>5} {:>10} {:>10} {:>10} {:>10} {:>8} {:>8}",
+        "rank", "rows", "cell", "data KiB", "hash", "hash pad", "ldt pad", "pad", "KiB/Mrow"
+    );
+    for (rank, (kib_per_mrow, kib, census)) in candidates.into_iter().take(24).enumerate() {
+        println!(
+            "{:>4} {:>5} {:>5} {:>10.1} {:>10} {:>10} {:>10} {:>7.2}x {:>8.1}",
+            rank + 1,
+            census.shape.n_rows,
+            census.shape.cell_len_ext,
+            kib,
+            census.poseidon_rows,
+            census.poseidon_rows_padded,
+            census.row_parity_rows_padded,
+            census.fused_hash_padding_overhead_bps() as f64 / 10_000.0,
+            kib_per_mrow,
+        );
+    }
 }
 
 pub fn compile_lean_da_bytecode(n_blobs: usize, construction: Construction) -> Bytecode {
@@ -230,8 +391,8 @@ fn build_column_commit_public_input(codewords: &[Vec<EF>]) -> [F; 8] {
 
     let mut row_digests = Vec::with_capacity(n_blobs);
     for row_idx in 0..n_blobs {
-        let systematic_digests = (0..num_systematic_leaves)
-            .map(|leaf_idx| leaf_digests[leaf_idx * n_blobs_padded + row_idx]);
+        let systematic_digests =
+            (0..num_systematic_leaves).map(|leaf_idx| leaf_digests[leaf_idx * n_blobs_padded + row_idx]);
         row_digests.push(chain_hash_digests(systematic_digests));
     }
     let row_commitment_root = chain_hash_digests(row_digests);
@@ -341,6 +502,102 @@ mod tests {
     fn test_column_commit_public_input_shape() {
         let (_witness, public_input) = build_instance(DEFAULT_N_BLOBS, Construction::ColumnCommit);
         assert_eq!(public_input.len(), 8);
+    }
+
+    #[test]
+    fn test_lean_air_commitment_matches_column_commit_public_input() {
+        let n_blobs = 3;
+        let codewords = generate_codewords(n_blobs);
+        let expected = build_column_commit_public_input(&codewords);
+        let shape = lean_air::LeanAirShape::new(LOG_M, n_blobs);
+        let trace = lean_air::build_trace_evens_then_odds(shape, &codewords);
+        let commitments = lean_air::commit_codewords_evens_then_odds(shape, &codewords);
+
+        assert_eq!(commitments.commitment_root, expected);
+        assert_eq!(commitments.row_digests.len(), n_blobs);
+        assert_eq!(commitments.column_roots.len(), shape.num_cells());
+        assert_eq!(trace.commitments, commitments);
+        assert!(!trace.poseidon_calls.is_empty());
+    }
+
+    #[test]
+    fn test_lean_air_precompile_layout_matches_poseidon_events() {
+        let n_blobs = 3;
+        let codewords = generate_codewords(n_blobs);
+        let shape = lean_air::LeanAirShape::new(LOG_M, n_blobs);
+        let trace = lean_air::build_trace_evens_then_odds(shape, &codewords);
+        let layout = lean_air::build_precompile_layout(&trace);
+
+        assert_eq!(layout.poseidon_requests.len(), trace.poseidon_calls.len());
+        for (request, call) in layout.poseidon_requests.iter().zip(&trace.poseidon_calls) {
+            assert_eq!(layout.memory[request.left_ptr..request.left_ptr + 8], call.input[..8]);
+            assert_eq!(layout.memory[request.right_ptr..request.right_ptr + 8], call.input[8..]);
+            assert_eq!(layout.memory[request.result_ptr..request.result_ptr + 8], call.output);
+        }
+    }
+
+    #[test]
+    fn test_lean_air_census_is_consistent() {
+        let n_blobs = 3;
+        let codewords = generate_codewords(n_blobs);
+        let shape = lean_air::LeanAirShape::new(LOG_M, n_blobs);
+        let trace = lean_air::build_trace_evens_then_odds(shape, &codewords);
+        let census = lean_air::air_census(shape, &trace);
+        let estimate = lean_air::estimate_air_census(shape);
+
+        assert_eq!(census.poseidon_calls(), trace.poseidon_calls.len());
+        assert_eq!(census, estimate);
+        assert_eq!(
+            census.poseidon_calls_by_kind.iter().sum::<usize>(),
+            trace.poseidon_calls.len()
+        );
+        assert_eq!(census.control_rows, trace.poseidon_calls.len());
+        assert_eq!(census.row_parity_rows, n_blobs * (1 << LOG_M));
+        assert_eq!(census.materialized_rlc_parity_rows(), 1 << LOG_M);
+        assert!(census.fused_hash_materialized_rlc_padded_rows() < census.fused_hash_padded_table_rows());
+        assert!(census.fused_hash_virtual_rlc_padded_rows() < census.fused_hash_materialized_rlc_padded_rows());
+        assert!(census.fused_hash_padded_table_rows() < census.total_padded_table_rows());
+        assert!(census.shared_memory_fes_estimate < census.duplicated_memory_fes);
+    }
+
+    #[test]
+    fn test_lean_air_schedules_are_consistent() {
+        let n_blobs = 3;
+        let shape = lean_air::LeanAirShape {
+            log_m: LOG_M,
+            n_rows: n_blobs,
+            cell_len_ext: 64,
+        };
+        let plan = lean_air::LeanAirTablePlan::new(shape);
+        let census = lean_air::estimate_air_census(shape);
+
+        assert_eq!(plan.hash.active_rows(), census.poseidon_rows);
+        assert_eq!(plan.hash.padded_rows, census.poseidon_rows_padded);
+        assert_eq!(plan.row_parity.active_rows, census.row_parity_rows);
+        assert_eq!(plan.row_parity.padded_rows, census.row_parity_rows_padded);
+
+        let first_hash = plan.hash.row_meta(0).unwrap();
+        assert_eq!(first_hash.kind, lean_air::PoseidonCallKind::CellHash);
+        assert_eq!(first_hash.row_idx, Some(0));
+        assert_eq!(first_hash.cell_idx, Some(0));
+        assert_eq!(first_hash.chunk_idx, Some(0));
+
+        let last_hash = plan.hash.row_meta(plan.hash.active_rows() - 1).unwrap();
+        assert_eq!(last_hash.kind, lean_air::PoseidonCallKind::FinalRoot);
+        assert_eq!(plan.hash.row_meta(plan.hash.active_rows()), None);
+
+        let first_parity = plan.row_parity.row_meta(0).unwrap();
+        assert_eq!(first_parity.row_idx, 0);
+        assert_eq!(first_parity.term_idx, 0);
+        assert!(first_parity.is_first);
+        assert!(!first_parity.is_last);
+
+        let last_parity = plan.row_parity.row_meta(plan.row_parity.active_rows - 1).unwrap();
+        assert_eq!(last_parity.row_idx, n_blobs - 1);
+        assert_eq!(last_parity.term_idx, shape.message_len_ext() - 1);
+        assert!(!last_parity.is_first);
+        assert!(last_parity.is_last);
+        assert_eq!(plan.row_parity.row_meta(plan.row_parity.active_rows), None);
     }
 
     #[test]

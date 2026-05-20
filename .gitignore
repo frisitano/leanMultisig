@@ -4,3 +4,8 @@
 minimal_zkVM.synctex.gz
 .claude
 misc/.build
+
+# Local private keys / AWS EC2 key pairs.
+*.pem
+*.key
+id_*

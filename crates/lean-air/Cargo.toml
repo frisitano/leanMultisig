@@ -1,0 +1,22 @@
+[package]
+name = "lean-air"
+version.workspace = true
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+profiling = ["system-info/profiling"]
+
+[dependencies]
+backend.workspace = true
+clap.workspace = true
+gpu-poseidon.workspace = true
+lean_prover.workspace = true
+lean_vm.workspace = true
+rayon.workspace = true
+sub_protocols.workspace = true
+system-info.workspace = true
+tracing.workspace = true
+utils.workspace = true

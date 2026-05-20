@@ -1,6 +1,109 @@
 include!(concat!(env!("OUT_DIR"), "/info.rs"));
 
+#[cfg(feature = "profiling")]
+use std::{
+    collections::BTreeMap,
+    sync::{
+        Mutex, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::{Duration, Instant},
+};
+
 const _: () = assert!(usize::BITS == 64, "this project requires a 64-bit target (for now)");
+
+#[cfg(feature = "profiling")]
+static CPU_STAGE: OnceLock<Mutex<String>> = OnceLock::new();
+#[cfg(feature = "profiling")]
+static CPU_STAGE_TIMING_ENABLED: AtomicBool = AtomicBool::new(false);
+#[cfg(feature = "profiling")]
+static CPU_STAGE_TIMINGS: OnceLock<Mutex<BTreeMap<String, Duration>>> = OnceLock::new();
+
+#[cfg(feature = "profiling")]
+pub fn enter_cpu_stage(stage: impl Into<String>) -> CpuStageGuard {
+    let stage = stage.into();
+    let mut current = cpu_stage().lock().unwrap();
+    let previous = std::mem::replace(&mut *current, stage.clone());
+    let start = CPU_STAGE_TIMING_ENABLED.load(Ordering::Relaxed).then(Instant::now);
+    CpuStageGuard { previous, stage, start }
+}
+
+#[cfg(not(feature = "profiling"))]
+#[inline(always)]
+pub fn enter_cpu_stage(_stage: impl Into<String>) -> CpuStageGuard {
+    CpuStageGuard
+}
+
+pub const fn cpu_stage_profiling_enabled() -> bool {
+    cfg!(feature = "profiling")
+}
+
+#[cfg(feature = "profiling")]
+pub fn current_cpu_stage() -> String {
+    cpu_stage().lock().unwrap().clone()
+}
+
+#[cfg(not(feature = "profiling"))]
+pub fn current_cpu_stage() -> String {
+    "profiling-disabled".to_string()
+}
+
+#[cfg(feature = "profiling")]
+pub fn reset_cpu_stage_timings() {
+    cpu_stage_timings().lock().unwrap().clear();
+    CPU_STAGE_TIMING_ENABLED.store(true, Ordering::Relaxed);
+}
+
+#[cfg(not(feature = "profiling"))]
+pub fn reset_cpu_stage_timings() {}
+
+#[cfg(feature = "profiling")]
+pub fn take_cpu_stage_timings() -> Vec<(String, Duration)> {
+    CPU_STAGE_TIMING_ENABLED.store(false, Ordering::Relaxed);
+    let mut timings = cpu_stage_timings().lock().unwrap();
+    std::mem::take(&mut *timings).into_iter().collect()
+}
+
+#[cfg(not(feature = "profiling"))]
+pub fn take_cpu_stage_timings() -> Vec<(String, std::time::Duration)> {
+    Vec::new()
+}
+
+#[cfg(feature = "profiling")]
+fn cpu_stage() -> &'static Mutex<String> {
+    CPU_STAGE.get_or_init(|| Mutex::new("idle".to_string()))
+}
+
+#[cfg(feature = "profiling")]
+fn cpu_stage_timings() -> &'static Mutex<BTreeMap<String, Duration>> {
+    CPU_STAGE_TIMINGS.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+#[cfg(feature = "profiling")]
+#[derive(Debug)]
+pub struct CpuStageGuard {
+    previous: String,
+    stage: String,
+    start: Option<Instant>,
+}
+
+#[cfg(not(feature = "profiling"))]
+#[derive(Debug)]
+pub struct CpuStageGuard;
+
+#[cfg(feature = "profiling")]
+impl Drop for CpuStageGuard {
+    fn drop(&mut self) {
+        if let Some(start) = self.start {
+            *cpu_stage_timings()
+                .lock()
+                .unwrap()
+                .entry(std::mem::take(&mut self.stage))
+                .or_default() += start.elapsed();
+        }
+        *cpu_stage().lock().unwrap() = std::mem::take(&mut self.previous);
+    }
+}
 
 pub fn peak_rss_bytes() -> u64 {
     let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
@@ -8,6 +111,18 @@ pub fn peak_rss_bytes() -> u64 {
     let max = ru.ru_maxrss as u64;
     // ru_maxrss unit: bytes on macOS, KiB on Linux.
     if cfg!(target_os = "macos") { max } else { max * 1024 }
+}
+
+pub fn process_cpu_time() -> std::time::Duration {
+    let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+    unsafe { libc::getrusage(libc::RUSAGE_SELF, &raw mut ru) };
+    timeval_duration(ru.ru_utime) + timeval_duration(ru.ru_stime)
+}
+
+fn timeval_duration(timeval: libc::timeval) -> std::time::Duration {
+    let secs = timeval.tv_sec.try_into().unwrap_or(0);
+    let micros = timeval.tv_usec.try_into().unwrap_or(0);
+    std::time::Duration::from_secs(secs) + std::time::Duration::from_micros(micros)
 }
 
 /// Number of jobs [`flush_rayon`] pushes. Must exceed

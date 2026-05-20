@@ -20,7 +20,9 @@ members = [
     "crates/backend/sumcheck",
     "crates/backend/system-info",
     "crates/backend/zk-alloc",
+    "crates/backend/gpu-poseidon",
 ]
+exclude = ["crates/lean-da-p3"]
 
 [workspace.lints]
 rust.missing_debug_implementations = "warn"
@@ -63,6 +65,7 @@ rec_aggregation = { path = "crates/rec_aggregation" }
 backend = { path = "crates/backend" }
 zk-alloc = { path = "crates/backend/zk-alloc" }
 system-info = { path = "crates/backend/system-info" }
+gpu-poseidon = { path = "crates/backend/gpu-poseidon" }
 
 # External
 sha3 = "0.11.0"

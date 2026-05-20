@@ -45,8 +45,10 @@ where
         assert!(self.validate_witness(&witness, polynomial));
         self.validate_statement(&statement);
 
-        let mut round_state =
-            RoundState::initialize_first_round_state(self, prover_state, statement, witness, polynomial).unwrap();
+        let mut round_state = {
+            let _cpu = system_info::enter_cpu_stage("prove/whir/initialize_round_state");
+            RoundState::initialize_first_round_state(self, prover_state, statement, witness, polynomial).unwrap()
+        };
 
         for round in 0..=self.n_rounds() {
             self.round(round, prover_state, &mut round_state).unwrap();
@@ -78,93 +80,119 @@ where
         let domain_reduction = 1 << self.rs_reduction_factor(round_index);
         let new_domain_size = round_state.domain_size / domain_reduction;
         let inv_rate = new_domain_size >> num_variables;
-        let folded_matrix = info_span!("FFT").in_scope(|| {
-            reorder_and_dft(
-                &folded_evaluations.by_ref(),
-                folding_factor_next,
-                log2_strict_usize(inv_rate),
-                1 << folding_factor_next,
-            )
-        });
+        let folded_matrix = {
+            let _cpu = system_info::enter_cpu_stage("prove/whir/round_fft");
+            info_span!("FFT").in_scope(|| {
+                reorder_and_dft(
+                    &folded_evaluations.by_ref(),
+                    folding_factor_next,
+                    log2_strict_usize(inv_rate),
+                    1 << folding_factor_next,
+                )
+            })
+        };
 
         let full = 1 << folding_factor_next;
-        let (prover_data, root) = MerkleData::build(folded_matrix, full, full);
+        let (prover_data, root) = {
+            let _cpu = system_info::enter_cpu_stage("prove/whir/round_merkle");
+            MerkleData::build(folded_matrix, full, full)
+        };
 
         prover_state.add_base_scalars(&root);
 
         // Handle OOD (Out-Of-Domain) samples
-        let (ood_points, ood_answers) =
+        let (ood_points, ood_answers) = {
+            let _cpu = system_info::enter_cpu_stage("prove/whir/ood");
             sample_ood_points::<EF, _>(prover_state, round_params.ood_samples, num_variables, |point| {
                 info_span!("ood evaluation").in_scope(|| folded_evaluations.evaluate(point))
-            });
+            })
+        };
 
         prover_state.pow_grinding(round_params.query_pow_bits);
 
-        let (ood_challenges, stir_challenges, stir_challenges_indexes) = self.compute_stir_queries(
-            prover_state,
-            round_state,
-            num_variables,
-            round_params,
-            &ood_points,
-            round_index,
-        )?;
+        let (ood_challenges, stir_challenges, stir_challenges_indexes) = {
+            let _cpu = system_info::enter_cpu_stage("prove/whir/stir_queries");
+            self.compute_stir_queries(
+                prover_state,
+                round_state,
+                num_variables,
+                round_params,
+                &ood_points,
+                round_index,
+            )?
+        };
 
         let folding_randomness = round_state.folding_randomness(
             self.folding_factor.at_round(round_index) + round_state.commitment_merkle_prover_data_b.is_some() as usize,
         );
 
-        let stir_evaluations = if let Some(data_b) = &round_state.commitment_merkle_prover_data_b {
-            let answers_a =
-                open_merkle_tree_at_challenges(&round_state.merkle_prover_data, prover_state, &stir_challenges_indexes);
-            let answers_b = open_merkle_tree_at_challenges(data_b, prover_state, &stir_challenges_indexes);
-            let mut stir_evaluations = Vec::new();
-            for (answer_a, answer_b) in answers_a.iter().zip(&answers_b) {
-                let vars_a = answer_a.by_ref().n_vars();
-                let vars_b = answer_b.by_ref().n_vars();
-                let a_trunc = folding_randomness[1..].to_vec();
-                let eval_a = answer_a.evaluate(&MultilinearPoint(a_trunc));
-                let b_trunc = folding_randomness[vars_a - vars_b + 1..].to_vec();
-                let eval_b = answer_b.evaluate(&MultilinearPoint(b_trunc));
-                let last_fold_rand_a = folding_randomness[0];
-                let last_fold_rand_b = folding_randomness[..vars_a - vars_b + 1]
-                    .iter()
-                    .map(|&x| EF::ONE - x)
-                    .product::<EF>();
-                stir_evaluations.push(eval_a * last_fold_rand_a + eval_b * last_fold_rand_b);
-            }
+        let stir_evaluations = {
+            let _cpu = system_info::enter_cpu_stage("prove/whir/open_merkle_queries");
+            if let Some(data_b) = &round_state.commitment_merkle_prover_data_b {
+                let answers_a = open_merkle_tree_at_challenges(
+                    &round_state.merkle_prover_data,
+                    prover_state,
+                    &stir_challenges_indexes,
+                );
+                let answers_b = open_merkle_tree_at_challenges(data_b, prover_state, &stir_challenges_indexes);
+                let mut stir_evaluations = Vec::new();
+                for (answer_a, answer_b) in answers_a.iter().zip(&answers_b) {
+                    let vars_a = answer_a.by_ref().n_vars();
+                    let vars_b = answer_b.by_ref().n_vars();
+                    let a_trunc = folding_randomness[1..].to_vec();
+                    let eval_a = answer_a.evaluate(&MultilinearPoint(a_trunc));
+                    let b_trunc = folding_randomness[vars_a - vars_b + 1..].to_vec();
+                    let eval_b = answer_b.evaluate(&MultilinearPoint(b_trunc));
+                    let last_fold_rand_a = folding_randomness[0];
+                    let last_fold_rand_b = folding_randomness[..vars_a - vars_b + 1]
+                        .iter()
+                        .map(|&x| EF::ONE - x)
+                        .product::<EF>();
+                    stir_evaluations.push(eval_a * last_fold_rand_a + eval_b * last_fold_rand_b);
+                }
 
-            stir_evaluations
-        } else {
-            open_merkle_tree_at_challenges(&round_state.merkle_prover_data, prover_state, &stir_challenges_indexes)
-                .iter()
-                .map(|answer| answer.evaluate(&folding_randomness))
-                .collect()
+                stir_evaluations
+            } else {
+                open_merkle_tree_at_challenges(&round_state.merkle_prover_data, prover_state, &stir_challenges_indexes)
+                    .iter()
+                    .map(|answer| answer.evaluate(&folding_randomness))
+                    .collect()
+            }
         };
 
         // Randomness for combination
         let combination_randomness_gen: EF = prover_state.sample();
         let ood_combination_randomness: Vec<_> = combination_randomness_gen.powers().collect_n(ood_challenges.len());
-        round_state
-            .sumcheck_prover
-            .add_new_equality(&ood_challenges, &ood_answers, &ood_combination_randomness);
+        {
+            let _cpu = system_info::enter_cpu_stage("prove/whir/add_ood_equality");
+            round_state
+                .sumcheck_prover
+                .add_new_equality(&ood_challenges, &ood_answers, &ood_combination_randomness);
+        }
         let stir_combination_randomness = combination_randomness_gen
             .powers()
             .skip(ood_challenges.len())
             .take(stir_challenges.len())
             .collect::<Vec<_>>();
 
-        round_state.sumcheck_prover.add_new_base_equality(
-            &stir_challenges,
-            &stir_evaluations,
-            &stir_combination_randomness,
-        );
+        {
+            let _cpu = system_info::enter_cpu_stage("prove/whir/add_stir_equality");
+            round_state.sumcheck_prover.add_new_base_equality(
+                &stir_challenges,
+                &stir_evaluations,
+                &stir_combination_randomness,
+            );
+        }
 
-        let next_folding_randomness = round_state.sumcheck_prover.run_sumcheck_many_rounds(
-            None,
-            prover_state,
-            folding_factor_next,
-            round_params.folding_pow_bits,
-        );
+        let next_folding_randomness = {
+            let _cpu = system_info::enter_cpu_stage("prove/whir/round_sumcheck");
+            round_state.sumcheck_prover.run_sumcheck_many_rounds(
+                None,
+                prover_state,
+                folding_factor_next,
+                round_params.folding_pow_bits,
+            )
+        };
 
         round_state.randomness_vec.extend_from_slice(&next_folding_randomness.0);
 
@@ -418,18 +446,24 @@ where
     ) -> (Self, MultilinearPoint<EF>) {
         assert_ne!(folding_factor, 0);
 
-        let (weights, sum) = combine_statement::<EF>(statement, combination_randomness);
+        let (weights, sum) = {
+            let _cpu = system_info::enter_cpu_stage("prove/whir/combine_statement");
+            combine_statement::<EF>(statement, combination_randomness)
+        };
 
         let mut evals = evals.pack();
         let mut weights = Mle::Owned(MleOwned::ExtensionPacked(weights));
-        let (challengess, new_sum, new_evals, new_weights) = run_product_sumcheck(
-            &evals.by_ref(),
-            &weights.by_ref(),
-            prover_state,
-            sum,
-            folding_factor,
-            pow_bits,
-        );
+        let (challengess, new_sum, new_evals, new_weights) = {
+            let _cpu = system_info::enter_cpu_stage("prove/whir/initial_product_sumcheck");
+            run_product_sumcheck(
+                &evals.by_ref(),
+                &weights.by_ref(),
+                prover_state,
+                sum,
+                folding_factor,
+                pow_bits,
+            )
+        };
 
         evals = new_evals.into();
         weights = new_weights.into();

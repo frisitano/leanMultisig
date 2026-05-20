@@ -73,23 +73,31 @@ where
         // DFT matrix width: skip as many zero columns as possible, aligned to packing (SIMD)
         let dft_n_cols = effective_n_cols.next_multiple_of(packing_width::<EF>()).min(n_blocks);
 
-        let folded_matrix = info_span!("FFT").in_scope(|| {
-            reorder_and_dft(
-                &polynomial.by_ref(),
-                self.folding_factor.at_round(0),
-                self.starting_log_inv_rate,
-                dft_n_cols,
-            )
-        });
+        let folded_matrix = {
+            let _cpu = system_info::enter_cpu_stage("prove/whir/commit_fft");
+            info_span!("FFT").in_scope(|| {
+                reorder_and_dft(
+                    &polynomial.by_ref(),
+                    self.folding_factor.at_round(0),
+                    self.starting_log_inv_rate,
+                    dft_n_cols,
+                )
+            })
+        };
 
-        let (prover_data, root) = MerkleData::build(folded_matrix, n_blocks, effective_n_cols);
+        let (prover_data, root) = {
+            let _cpu = system_info::enter_cpu_stage("prove/whir/commit_merkle");
+            MerkleData::build(folded_matrix, n_blocks, effective_n_cols)
+        };
 
         prover_state.add_base_scalars(&root);
 
-        let (ood_points, ood_answers) =
+        let (ood_points, ood_answers) = {
+            let _cpu = system_info::enter_cpu_stage("prove/whir/commit_ood");
             sample_ood_points::<EF, _>(prover_state, self.commitment_ood_samples, self.num_variables, |point| {
                 polynomial.evaluate(point)
-            });
+            })
+        };
 
         Witness {
             prover_data,

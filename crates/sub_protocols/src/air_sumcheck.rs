@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::ops::{Add, AddAssign, Mul, Sub};
+use std::time::{Duration, Instant};
 
 use backend::*;
 use lean_vm::ColIndex;
@@ -32,6 +33,10 @@ use tracing::info_span;
 const ENDIANNESS_PIVOT_AIR: usize = 12;
 
 pub trait OuterSumcheckSession<EF: ExtensionField<PF<EF>>>: Debug {
+    fn label(&self) -> &'static str {
+        "sumcheck session"
+    }
+
     fn initial_n_vars(&self) -> usize;
     fn sum(&self) -> EF;
     fn bare_degree(&self) -> usize;
@@ -206,6 +211,10 @@ where
     A: Air + Debug + 'static,
     A::ExtraData: AlphaPowers<EF> + AlphaPowersMut<EF> + Debug,
 {
+    fn label(&self) -> &'static str {
+        "air"
+    }
+
     fn initial_n_vars(&self) -> usize {
         self.initial_n_vars
     }
@@ -641,6 +650,8 @@ pub fn prove_batched_air_sumcheck<'a, EF: ExtensionField<PF<EF>>>(
     let n_rounds = sessions.iter().map(|s| s.initial_n_vars()).max().unwrap_or(0);
     let max_full_degree = sessions.iter().map(|s| s.bare_degree() + 1).max().unwrap_or(1);
     let eta_powers: Vec<EF> = eta.powers().collect_n(sessions.len());
+    let mut compute_times = vec![Duration::ZERO; sessions.len()];
+    let mut process_times = vec![Duration::ZERO; sessions.len()];
 
     let mut challenges = Vec::with_capacity(n_rounds);
     let mut k: Vec<EF> = vec![EF::ONE; sessions.len()];
@@ -654,7 +665,14 @@ pub fn prove_batched_air_sumcheck<'a, EF: ExtensionField<PF<EF>>>(
             if round < join_round {
                 combined_coeffs[1] += eta_powers[idx] * k[idx] * session.sum();
             } else {
-                let bare_poly = session.compute_bare_round_poly();
+                let start = Instant::now();
+                let bare_poly = info_span!(
+                    "batched sumcheck compute round",
+                    session = session.label(),
+                    round
+                )
+                .in_scope(|| session.compute_bare_round_poly());
+                compute_times[idx] += start.elapsed();
                 let full_coeffs = expand_bare_to_full(&bare_poly.coeffs, session.eq_alpha());
                 for (i, &c) in full_coeffs.iter().enumerate() {
                     combined_coeffs[i] += eta_powers[idx] * k[idx] * c;
@@ -672,9 +690,28 @@ pub fn prove_batched_air_sumcheck<'a, EF: ExtensionField<PF<EF>>>(
             if round < join_round {
                 k[idx] *= challenge;
             } else if let Some(bare_poly) = &bare_polys[idx] {
-                session.process_challenge(challenge, bare_poly);
+                let start = Instant::now();
+                info_span!(
+                    "batched sumcheck process challenge",
+                    session = session.label(),
+                    round
+                )
+                .in_scope(|| session.process_challenge(challenge, bare_poly));
+                process_times[idx] += start.elapsed();
             }
         }
+    }
+
+    for (idx, session) in sessions.iter().enumerate() {
+        let compute_ms = compute_times[idx].as_secs_f64() * 1_000.0;
+        let process_ms = process_times[idx].as_secs_f64() * 1_000.0;
+        info_span!(
+            "batched sumcheck session total",
+            session = session.label(),
+            compute_ms,
+            process_ms
+        )
+        .in_scope(|| {});
     }
 
     MultilinearPoint(challenges)
